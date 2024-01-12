@@ -1021,7 +1021,7 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
         debug("needed space is %d\n", neededSpace);
 
         /* Calculate how many bytes are needed out of the additional pages. */
-        size_t extraSpace = neededSpace - startOffset; 
+        size_t extraSpace = neededSpace - startOffset;
         // Always give one extra page to avoid colliding with segments that start at
         // unaligned addresses and will be rounded down when loaded
         unsigned int neededPages = 1 + roundUp(extraSpace, getPageSize()) / getPageSize();
@@ -1237,8 +1237,14 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
             }
             else if (d_tag == DT_VERNEED)
                 dyn->d_un.d_ptr = findSectionHeader(".gnu.version_r").sh_addr;
+            else if (d_tag == DT_VERNEEDNUM)
+                dyn->d_un.d_val = findSectionHeader(".gnu.version_r").sh_info;
             else if (d_tag == DT_VERSYM)
                 dyn->d_un.d_ptr = findSectionHeader(".gnu.version").sh_addr;
+            else if (d_tag == DT_VERDEF)
+                dyn->d_un.d_ptr = findSectionHeader(".gnu.version_d").sh_addr;
+            else if (d_tag == DT_VERDEFNUM)
+                dyn->d_un.d_val = findSectionHeader(".gnu.version_d").sh_info;
             else if (d_tag == DT_MIPS_RLD_MAP_REL) {
                 /* the MIPS_RLD_MAP_REL tag stores the offset to the debug
                    pointer, relative to the address of the tag */
@@ -2106,7 +2112,7 @@ void ElfFile<ElfFileParamNames>::rebuildGnuHashTable(span<char> strTab, span<Elf
     }
 
     // Update bloom filters
-    std::fill(ght.m_bloomFilters.begin(), ght.m_bloomFilters.end(), 0); 
+    std::fill(ght.m_bloomFilters.begin(), ght.m_bloomFilters.end(), 0);
     for (size_t i = 0; i < entries.size(); ++i)
     {
         auto h = entries[i].hash;
@@ -2118,7 +2124,7 @@ void ElfFile<ElfFileParamNames>::rebuildGnuHashTable(span<char> strTab, span<Elf
     }
 
     // Fill buckets
-    std::fill(ght.m_buckets.begin(), ght.m_buckets.end(), 0); 
+    std::fill(ght.m_buckets.begin(), ght.m_buckets.end(), 0);
     for (size_t i = 0; i < entries.size(); ++i)
     {
         auto symBucketIdx = entries[i].bucketIdx;
@@ -2348,6 +2354,7 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
     auto shdrVersym = findSectionHeader(".gnu.version");
 
     auto strTab = (char *)fileContents->data() + rdi(shdrDynStr.sh_offset);
+    auto strTabSize = rdi(shdrDynStr.sh_size);
     auto dynsyms = (Elf_Sym *)(fileContents->data() + rdi(shdrDynsym.sh_offset));
     auto versyms = (Elf_Versym *)(fileContents->data() + rdi(shdrVersym.sh_offset));
     const size_t count = rdi(shdrDynsym.sh_size) / sizeof(Elf_Sym);
@@ -2355,7 +2362,7 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
     if (count != rdi(shdrVersym.sh_size) / sizeof(Elf_Versym))
         error("versym size mismatch");
 
-    auto shdrVerdef = findSectionHeader(".gnu.version_d");
+    auto &shdrVerdef = findSectionHeader(".gnu.version_d");
     auto verdef = (char *)(fileContents->data() + rdi(shdrVerdef.sh_offset));
 
     std::map<int, std::string> verdefMap;
@@ -2369,6 +2376,10 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
     off_t curoff = 0;
 
     int map_to_ndx = -1;
+    int max_ndx = 0;
+    off_t last_verdef_off = 0;
+    off_t mapToStrOff = 0;
+    bool mapToAdded = false;
 
     for(int i = 0; i < verdef_entries; i++){
         Elf_Verdef *vd = (Elf_Verdef *) (verdef + curoff);
@@ -2382,17 +2393,21 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
             error(fmt("verdef entry aux overflow: idx=", i));
         std::string_view name = &strTab[rdi(aux->vda_name)];
         debug("verdef entry %d: %s, ndx=%d\n", i, name.data(), ndx);
-
+        if (ndx > max_ndx)
+            max_ndx = ndx;
         if (name == mapTo) {
             map_to_ndx = ndx;
+            mapToStrOff = rdi(aux->vda_name);
         }
         if(ndx != 0 && ndx != 1){
             verdefMap[ndx] = name;
         }
 
         if(rdi(vd->vd_next) == 0){
-            if(i == verdef_entries - 1)
+            if(i == verdef_entries - 1){
+                last_verdef_off = curoff;
                 break;
+            }
             else
                 error(fmt("verdef entry should have next entry: idx=", i));
         }
@@ -2400,11 +2415,92 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
             error(fmt("verdef entry next out of bounds: idx=", i));
         curoff += rdi(vd->vd_next);
     }
-    if (map_to_ndx == -1)
-        error(fmt("verdef entry for ", mapTo, " not found"));
-    else
-        debug("verdef entry for %s found at ndx=%d\n", mapTo.c_str(), map_to_ndx);
+    if (map_to_ndx == -1){
+        debug("verdef entry for %s not found, trying to insert one\n", mapTo.c_str());
+        auto verneedhdr = tryFindSectionHeader(".gnu.version_r");
+        if(verneedhdr){
+            auto &shdrVerNeed = verneedhdr->get();
+            auto verneed = (char *)(fileContents->data() + rdi(shdrVerNeed.sh_offset));
 
+            debug("found .gnu.version_r, parsing\n");
+            int verneed_entries = rdi(shdrVerNeed.sh_info);
+            debug(".gnu.version_r: %d entries\n", verdef_entries);
+
+            auto verneed_end = verneed + rdi(shdrVerNeed.sh_size);
+            off_t curoff = 0;
+            for(int i = 0; i < verneed_entries; i++){
+                Elf_Verneed *vn = (Elf_Verneed *) (verneed + curoff);
+                if ((char *)vn + sizeof(Elf_Verneed) > verneed_end)
+                    error(fmt("verneed entry overflow: idx=", i));
+                auto aux_cnt = rdi(vn->vn_cnt);
+                debug("file: %s, %d versions\n", &strTab[rdi(vn->vn_file)], aux_cnt);
+                off_t aux_off = rdi(vn->vn_aux);
+                if ((char *)vn + aux_off >= verneed_end)
+                    error(fmt("verneed entry aux out of bounds: idx=", i));
+                for(int j = 0; j < aux_cnt; j++){
+                    auto aux = (Elf_Vernaux *) ((char *)vn + aux_off);
+                    if ((char *)aux + sizeof(Elf_Vernaux) > verneed_end)
+                        error(fmt("verneed entry aux overflow: idx=", i, "aux idx=", j));
+                    auto ndx = rdi(aux->vna_other) & VERSYM_VERSION;
+                    debug("  %s, ndx=%d\n", &strTab[rdi(aux->vna_name)], ndx);
+                    if (ndx > max_ndx)
+                        max_ndx = ndx;
+                    if (rdi(aux->vna_next) == 0){
+                        if (j == aux_cnt - 1)
+                            break;
+                        else
+                            error(fmt("verneed entry should have next entry: idx=", i, "aux idx=", j));
+                    }
+                    if ((char *)aux + rdi(aux->vna_next) >= verneed_end)
+                        error(fmt("verneed entry next out of bounds: idx=", i, "aux idx=", j));
+                    aux_off += rdi(aux->vna_next);
+                }
+                if (rdi(vn->vn_next) == 0){
+                    if (i == verneed_entries - 1)
+                        break;
+                    else
+                        error(fmt("verneed entry should have next entry: idx=", i));
+                }
+                if ((char *)vn + rdi(vn->vn_next) >= verneed_end)
+                    error(fmt("verneed entry next out of bounds: idx=", i));
+                curoff += rdi(vn->vn_next);
+            }
+        }else{
+            debug("no .gnu.version_r found\n");
+        }
+        map_to_ndx = max_ndx + 1;
+        debug("decided to use %d for %s\n", map_to_ndx, mapTo.c_str());
+        if(map_to_ndx > VERSYM_VERSION){
+            error(fmt("version index %d is too large", map_to_ndx));
+        }
+        verdefMap[map_to_ndx] = mapTo;
+        auto & newVerdef = replaceSection(".gnu.version_d", rdi(shdrVerdef.sh_size) + sizeof(Elf_Verdef) + sizeof(Elf_Verdaux));
+        char * newVerdefData = newVerdef.data();
+        Elf_Verdef *lastVd = (Elf_Verdef *)(newVerdefData + last_verdef_off);
+        Elf_Verdef *newVd = (Elf_Verdef *)(newVerdefData + rdi(shdrVerdef.sh_size));
+        wri(lastVd->vd_next, (char *)newVd - (char *)lastVd);
+        wri(newVd->vd_version, 1);
+        wri(newVd->vd_flags, 0);
+        wri(newVd->vd_ndx, map_to_ndx);
+        wri(newVd->vd_cnt, 1);
+        wri(newVd->vd_hash, sysvHash(mapTo));
+        wri(newVd->vd_aux, sizeof(Elf_Verdef));
+        wri(newVd->vd_next, 0);
+        Elf_Verdaux *newVda = (Elf_Verdaux *)((char *)newVd + sizeof(Elf_Verdef));
+        wri(newVda->vda_next, 0);
+        wri(((Elf_Shdr *)(&shdrVerdef))->sh_info, rdi(shdrVerdef.sh_info) + 1);
+        verdef_entries += 1;
+
+        auto & newDynStr = replaceSection(".dynstr", rdi(shdrDynStr.sh_size) + mapTo.size() + 1);
+        mapToStrOff = rdi(shdrDynStr.sh_size);
+        setSubstr(newDynStr, mapToStrOff, mapTo + '\0');
+        strTab = newDynStr.data();
+        strTabSize = newDynStr.size();
+        wri(newVda->vda_name, mapToStrOff);
+        mapToAdded = true;
+    }else{
+        debug("verdef entry for %s found at ndx=%d\n", mapTo.c_str(), map_to_ndx);
+    }
     std::map<std::string, std::map<std::string, int>> symVersionMap;
 
     debug("Parsing .dynsym\n");
@@ -2458,8 +2554,8 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
         debug("removing %s@%s from new dsyms list\n", syms.first.c_str(), mapTo.c_str());
         newDsyms.erase(syms.first);
     }
-    auto newDynsymSize = newDsyms.size() * sizeof(Elf_Sym) + rdi(shdrDynsym.sh_size);
-    auto newVersymSize = newDsyms.size() * sizeof(Elf_Versym) + rdi(shdrVersym.sh_size);
+    auto newDynsymSize = (newDsyms.size() + (mapToAdded ? 1 : 0)) * sizeof(Elf_Sym) + rdi(shdrDynsym.sh_size);
+    auto newVersymSize = (newDsyms.size() + (mapToAdded ? 1 : 0)) * sizeof(Elf_Versym) + rdi(shdrVersym.sh_size);
 
     auto& newDynsym = replaceSection(".dynsym", newDynsymSize);
     auto& newVersym = replaceSection(".gnu.version", newVersymSize);
@@ -2477,12 +2573,22 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
             wri(newVersymSpan[sym], rdi(newVersymSpan[sym]) | VERSYM_HIDDEN);
             i += 1;
         }
+        if(mapToAdded){
+            debug("Adding %s@%s to dynsym list\n", mapTo.c_str(), mapTo.c_str());
+            wri(newDynsymSpan[i].st_name, mapToStrOff);
+            wri(newDynsymSpan[i].st_info, STB_GLOBAL << 4 | STT_OBJECT);
+            wri(newDynsymSpan[i].st_other, STV_DEFAULT);
+            wri(newDynsymSpan[i].st_shndx, SHN_ABS);
+            wri(newDynsymSpan[i].st_value, 0);
+            wri(newDynsymSpan[i].st_size, 0);
+            wri(newVersymSpan[i], map_to_ndx);
+        }
     }
 
     debug("Rebuilding hash tables\n");
 
-    rebuildGnuHashTable(span(strTab, rdi(shdrDynStr.sh_size)), newDynsymSpan, newVersymSpan);
-    rebuildHashTable(span(strTab, rdi(shdrDynStr.sh_size)), newDynsymSpan, newDsyms.size());
+    rebuildGnuHashTable(span(strTab, strTabSize), newDynsymSpan, newVersymSpan);
+    rebuildHashTable(span(strTab, strTabSize), newDynsymSpan, newDsyms.size() + (mapToAdded ? 1 : 0));
 
     this->rewriteSections();
 
