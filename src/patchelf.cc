@@ -2019,7 +2019,7 @@ auto ElfFile<ElfFileParamNames>::parseGnuHashTable(span<char> sectionData) -> Gn
 }
 
 template<ElfFileParams>
-void ElfFile<ElfFileParamNames>::rebuildGnuHashTable(span<char> strTab, span<Elf_Sym> dynsyms)
+void ElfFile<ElfFileParamNames>::rebuildGnuHashTable(span<char> strTab, span<Elf_Sym> dynsyms, span<Elf_Versym> versyms)
 {
     auto sectionData = tryGetSectionSpan<char>(".gnu.hash");
     if (!sectionData)
@@ -2031,12 +2031,20 @@ void ElfFile<ElfFileParamNames>::rebuildGnuHashTable(span<char> strTab, span<Elf
     if (ght.m_table.size() == 0)
         return;
 
+    if (ght.m_table.size() + rdi(ght.m_hdr.symndx) < dynsyms.size()){
+        debug("gnuhash table is too small, rebuilding\n");
+        auto & newSection = replaceSection(".gnu.hash", sectionData.size() + (dynsyms.size() - ght.m_table.size() - rdi(ght.m_hdr.symndx)) * sizeof(uint32_t));
+        sectionData = span<char>(newSection.data(), newSection.size());
+        ght = parseGnuHashTable(sectionData);
+    }
+
     // The hash table includes only a subset of dynsyms
     auto firstSymIdx = rdi(ght.m_hdr.symndx);
     dynsyms = span(&dynsyms[firstSymIdx], dynsyms.end());
 
     // Only use the range of symbol versions that will be changed
-    auto versyms = tryGetSectionSpan<Elf_Versym>(".gnu.version");
+    if (!versyms)
+        versyms = tryGetSectionSpan<Elf_Versym>(".gnu.version");
     if (versyms)
         versyms = span(&versyms[firstSymIdx], versyms.end());
 
@@ -2151,13 +2159,22 @@ auto ElfFile<ElfFileParamNames>::parseHashTable(span<char> sectionData) -> HashT
 }
 
 template<ElfFileParams>
-void ElfFile<ElfFileParamNames>::rebuildHashTable(span<char> strTab, span<Elf_Sym> dynsyms)
+void ElfFile<ElfFileParamNames>::rebuildHashTable(span<char> strTab, span<Elf_Sym> dynsyms, int moreSyms)
 {
     auto sectionData = tryGetSectionSpan<char>(".hash");
     if (!sectionData)
         return;
 
     auto ht = parseHashTable(sectionData);
+
+    if(moreSyms > 0)
+    {
+        auto & newSection = replaceSection(".hash", sectionData.size() + moreSyms * sizeof(uint32_t));
+        sectionData = span<char>(newSection.data(), newSection.size());
+        auto hdr = (typename HashTable::Header*)sectionData.begin();
+        wri(hdr->nchain, rdi(hdr->nchain) + moreSyms);
+        ht = parseHashTable(sectionData);
+    }
 
     std::fill(ht.m_buckets.begin(), ht.m_buckets.end(), 0);
     std::fill(ht.m_chain.begin(), ht.m_chain.end(), 0);
@@ -2324,6 +2341,155 @@ void ElfFile<ElfFileParamNames>::modifyExecstack(ExecstackMode op)
 }
 
 template<ElfFileParams>
+void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom)
+{
+    auto shdrDynStr = findSectionHeader(".dynstr");
+    auto shdrDynsym = findSectionHeader(".dynsym");
+    auto shdrVersym = findSectionHeader(".gnu.version");
+
+    auto strTab = (char *)fileContents->data() + rdi(shdrDynStr.sh_offset);
+    auto dynsyms = (Elf_Sym *)(fileContents->data() + rdi(shdrDynsym.sh_offset));
+    auto versyms = (Elf_Versym *)(fileContents->data() + rdi(shdrVersym.sh_offset));
+    const size_t count = rdi(shdrDynsym.sh_size) / sizeof(Elf_Sym);
+
+    if (count != rdi(shdrVersym.sh_size) / sizeof(Elf_Versym))
+        error("versym size mismatch");
+
+    auto shdrVerdef = findSectionHeader(".gnu.version_d");
+    auto verdef = (char *)(fileContents->data() + rdi(shdrVerdef.sh_offset));
+
+    std::map<int, std::string> verdefMap;
+
+    debug("Parsing .gnu.version_d\n");
+
+    int verdef_entries = rdi(shdrVerdef.sh_info);
+    debug(".gnu.version_d: %d entries\n", verdef_entries);
+
+    auto verdef_end = verdef + rdi(shdrVerdef.sh_size);
+    off_t curoff = 0;
+
+    int map_to_ndx = -1;
+
+    for(int i = 0; i < verdef_entries; i++){
+        Elf_Verdef *vd = (Elf_Verdef *) (verdef + curoff);
+        if ((char *)vd + sizeof(Elf_Verdef) > verdef_end)
+            error(fmt("verdef entry overflow: idx=", i));
+        auto ndx = rdi(vd->vd_ndx);
+        if ((char *)vd + rdi(vd->vd_aux) >= verdef_end)
+            error(fmt("verdef entry aux out of bounds: idx=", i));
+        auto aux = (Elf_Verdaux *) ((char *)vd + rdi(vd->vd_aux));
+        if ((char *)aux + sizeof(Elf_Verdaux) > verdef_end)
+            error(fmt("verdef entry aux overflow: idx=", i));
+        std::string_view name = &strTab[rdi(aux->vda_name)];
+        debug("verdef entry %d: %s, ndx=%d\n", i, name.data(), ndx);
+
+        if (name == mapTo) {
+            map_to_ndx = ndx;
+        }
+        if(ndx != 0 && ndx != 1){
+            verdefMap[ndx] = name;
+        }
+
+        if(rdi(vd->vd_next) == 0){
+            if(i == verdef_entries - 1)
+                break;
+            else
+                error(fmt("verdef entry should have next entry: idx=", i));
+        }
+        if((char *)vd + rdi(vd->vd_next) >= verdef_end)
+            error(fmt("verdef entry next out of bounds: idx=", i));
+        curoff += rdi(vd->vd_next);
+    }
+    if (map_to_ndx == -1)
+        error(fmt("verdef entry for ", mapTo, " not found"));
+    else
+        debug("verdef entry for %s found at ndx=%d\n", mapTo.c_str(), map_to_ndx);
+
+    std::map<std::string, std::map<std::string, int>> symVersionMap;
+
+    debug("Parsing .dynsym\n");
+    for(size_t i = 0; i < count; i++){
+        auto dynsym = &dynsyms[i];
+        std::string name = strTab + rdi(dynsym->st_name);
+        if(name.empty())
+            continue;
+        debug("dynsym entry %d: %s ", i, name.c_str());
+        auto shndx = rdi(dynsym->st_shndx);
+        if(shndx == SHN_UNDEF){
+            debug("(undefined)\n");
+            continue;
+        }else if(shndx == SHN_ABS){
+            debug("(absolute)\n");
+            continue;
+        }else if(shndx == SHN_COMMON){
+            debug("(common)\n");
+            continue;
+        }
+        auto verndx = rdi(versyms[i]);
+        if(verndx == 0){
+            debug("(local)\n");
+            continue;
+        }else if(verndx == 1){
+            debug("(global)\n");
+            continue;
+        }
+        auto verdef_ndx = verndx & VERSYM_VERSION;
+        if(verdefMap.find(verdef_ndx) == verdefMap.end()){
+            debug("(verdef %d not found)\n", verdef_ndx);
+            continue;
+        }
+        debug("(ver: %s)\n", verdefMap[verdef_ndx].c_str());
+        symVersionMap[verdefMap[verdef_ndx]][name] = i;
+    }
+
+    debug("Generating new dsyms list\n");
+    std::map<std::string, int> newDsyms;
+    for(const auto &fromVer : mapFrom){
+        if(symVersionMap.find(fromVer) == symVersionMap.end()){
+            debug("No symbols with version %s found\n", fromVer.c_str());
+            continue;
+        }
+        for(auto sym : symVersionMap[fromVer]){
+            debug("Adding %s@%s to new dsyms list\n", sym.first.c_str(), fromVer.c_str());
+            newDsyms[sym.first] = sym.second;
+        }
+    }
+    for(const auto &syms : symVersionMap[mapTo]){
+        debug("removing %s@%s from new dsyms list\n", syms.first.c_str(), mapTo.c_str());
+        newDsyms.erase(syms.first);
+    }
+    auto newDynsymSize = newDsyms.size() * sizeof(Elf_Sym) + rdi(shdrDynsym.sh_size);
+    auto newVersymSize = newDsyms.size() * sizeof(Elf_Versym) + rdi(shdrVersym.sh_size);
+
+    auto& newDynsym = replaceSection(".dynsym", newDynsymSize);
+    auto& newVersym = replaceSection(".gnu.version", newVersymSize);
+
+    auto newDynsymSpan = span<Elf_Sym>((Elf_Sym *)newDynsym.data(), newDynsymSize / sizeof(Elf_Sym));
+    auto newVersymSpan = span<Elf_Versym>((Elf_Versym *)newVersym.data(), newVersymSize / sizeof(Elf_Versym));
+
+    {
+        int i = count;
+        for(auto it = newDsyms.cbegin(); it != newDsyms.cend(); ++it){
+            auto sym = it->second;
+            debug("Adding %s@%s to dynsym list\n", it->first.c_str(), mapTo.c_str());
+            newDynsymSpan[i] = dynsyms[sym];
+            wri(newVersymSpan[i], map_to_ndx);
+            wri(newVersymSpan[sym], rdi(newVersymSpan[sym]) | VERSYM_HIDDEN);
+            i += 1;
+        }
+    }
+
+    debug("Rebuilding hash tables\n");
+
+    rebuildGnuHashTable(span(strTab, rdi(shdrDynStr.sh_size)), newDynsymSpan, newVersymSpan);
+    rebuildHashTable(span(strTab, rdi(shdrDynStr.sh_size)), newDynsymSpan, newDsyms.size());
+
+    this->rewriteSections();
+
+    changed = true;
+}
+
+template<ElfFileParams>
 template<class StrIdxCallback>
 void ElfFile<ElfFileParamNames>::forAllStringReferences(const Elf_Shdr& strTabHdr, StrIdxCallback&& fn)
 {
@@ -2387,6 +2553,9 @@ static bool noDefaultLib = false;
 static bool printExecstack = false;
 static bool clearExecstack = false;
 static bool setExecstack = false;
+static bool remapSymvers = false;
+static std::string symverMapTo;
+static std::vector<std::string> symverMapFrom;
 
 template<class ElfFile>
 static void patchElf2(ElfFile && elfFile, const FileContents & fileContents, const std::string & fileName)
@@ -2443,6 +2612,9 @@ static void patchElf2(ElfFile && elfFile, const FileContents & fileContents, con
 
     if (renameDynamicSymbols)
         elfFile.renameDynamicSymbols(symbolsToRename);
+
+    if (remapSymvers)
+        elfFile.remapSymvers(symverMapTo, symverMapFrom);
 
     if (elfFile.isChanged()){
         writeFile(fileName, elfFile.fileContents);
@@ -2509,6 +2681,7 @@ static void showHelp(const std::string & progName)
   [--set-execstack]\n\
   [--rename-dynamic-symbols NAME_MAP_FILE]\tRenames dynamic symbols. The map file should contain two symbols (old_name new_name) per line\n\
   [--no-clobber-old-sections]\t\tDo not clobber old section values - only use when the binary expects to find section info at the old location.\n\
+  [--remap-symvers TO=FROM1,FROM2...]\n\
   [--output FILE]\n\
   [--debug]\n\
   [--version]\n\
@@ -2667,6 +2840,41 @@ static int mainWrapped(int argc, char * * argv)
         }
         else if (arg == "--no-clobber-old-sections") {
             clobberOldSections = false;
+        }
+        else if (arg == "--remap-symvers") {
+            remapSymvers = true;
+            if (++i == argc) error("missing argument");
+
+            const char* mapping = argv[i];
+            for(int i = 0; mapping[i]; ++i)
+            {
+                if (mapping[i] == '=')
+                {
+                    char *mapto = strndup(mapping, i);
+                    symverMapTo = mapto;
+                    free(mapto);
+                    mapping += i + 1;
+                    break;
+                }
+            }
+            if (symverMapTo.empty())
+                error(fmt("Invalid symver mapping, must contains =: ", mapping));
+            for(int i = 0; mapping[i]; ++i)
+            {
+                if (mapping[i] == ',')
+                {
+                    char *mapfrom = strndup(mapping, i);
+                    if(strlen(mapfrom) != 0)
+                        symverMapFrom.push_back(mapfrom);
+                    free(mapfrom);
+                    mapping += i + 1;
+                    i = -1;
+                }
+            }
+            if (strlen(mapping) != 0)
+                symverMapFrom.push_back(mapping);
+            if (symverMapFrom.empty())
+                error(fmt("Invalid symver mapping, must contains at least one from: ", mapping));
         }
         else if (arg == "--help" || arg == "-h" ) {
             showHelp(argv[0]);
