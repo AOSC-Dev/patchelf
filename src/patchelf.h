@@ -175,6 +175,8 @@ public:
 
     void modifyExecstack(ExecstackMode op);
 
+    void remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom, bool alsoRemapVerneed);
+
 private:
     struct GnuHashTable {
         using BloomWord = Elf_Addr;
@@ -194,8 +196,8 @@ private:
     };
     HashTable parseHashTable(span<char> gh);
 
-    void rebuildGnuHashTable(span<char> strTab, span<Elf_Sym> dynsyms);
-    void rebuildHashTable(span<char> strTab, span<Elf_Sym> dynsyms);
+    void rebuildGnuHashTable(span<char> strTab, span<Elf_Sym> dynsyms, span<Elf_Versym> versyms = {nullptr, nullptr});
+    void rebuildHashTable(span<char> strTab, span<Elf_Sym> dynsyms, int moreSyms = 0);
 
     using Elf_Rel_Info = decltype(Elf_Rel::r_info);
 

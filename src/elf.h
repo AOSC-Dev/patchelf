@@ -55,6 +55,8 @@ typedef uint16_t Elf64_Section;
 typedef Elf32_Half Elf32_Versym;
 typedef Elf64_Half Elf64_Versym;
 
+#define VERSYM_HIDDEN		0x8000
+#define VERSYM_VERSION		0x7fff
 
 /* The ELF file header.  This appears at the start of every ELF file.  */
 
