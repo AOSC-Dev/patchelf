@@ -175,7 +175,7 @@ public:
 
     void modifyExecstack(ExecstackMode op);
 
-    void remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom);
+    void remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom, bool alsoRemapVerneed);
 
 private:
     struct GnuHashTable {

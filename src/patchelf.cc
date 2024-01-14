@@ -2347,7 +2347,7 @@ void ElfFile<ElfFileParamNames>::modifyExecstack(ExecstackMode op)
 }
 
 template<ElfFileParams>
-void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom)
+void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom, bool alsoPathVerNeed)
 {
     auto shdrDynStr = findSectionHeader(".dynstr");
     auto shdrDynsym = findSectionHeader(".dynsym");
@@ -2416,58 +2416,76 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
         curoff += rdi(vd->vd_next);
     }
     if (map_to_ndx == -1){
-        debug("verdef entry for %s not found, trying to insert one\n", mapTo.c_str());
-        auto verneedhdr = tryFindSectionHeader(".gnu.version_r");
-        if(verneedhdr){
-            auto &shdrVerNeed = verneedhdr->get();
-            auto verneed = (char *)(fileContents->data() + rdi(shdrVerNeed.sh_offset));
+        debug("no version index for %s, adding\n", mapTo.c_str());
+        auto & newDynStr = replaceSection(".dynstr", rdi(shdrDynStr.sh_size) + mapTo.size() + 1);
+        mapToStrOff = rdi(shdrDynStr.sh_size);
+        setSubstr(newDynStr, mapToStrOff, mapTo + '\0');
+        strTab = newDynStr.data();
+        strTabSize = newDynStr.size();
+    }
+    debug("parsing verneed entries\n", mapTo.c_str());
+    auto verneedhdr = tryFindSectionHeader(".gnu.version_r");
+    if(verneedhdr){
+        auto &shdrVerNeed = verneedhdr->get();
+        auto verneed = (char *)(fileContents->data() + rdi(shdrVerNeed.sh_offset));
 
-            debug("found .gnu.version_r, parsing\n");
-            int verneed_entries = rdi(shdrVerNeed.sh_info);
-            debug(".gnu.version_r: %d entries\n", verdef_entries);
+        debug("found .gnu.version_r, parsing\n");
+        int verneed_entries = rdi(shdrVerNeed.sh_info);
+        debug(".gnu.version_r: %d entries\n", verdef_entries);
 
-            auto verneed_end = verneed + rdi(shdrVerNeed.sh_size);
-            off_t curoff = 0;
-            for(int i = 0; i < verneed_entries; i++){
-                Elf_Verneed *vn = (Elf_Verneed *) (verneed + curoff);
-                if ((char *)vn + sizeof(Elf_Verneed) > verneed_end)
-                    error(fmt("verneed entry overflow: idx=", i));
-                auto aux_cnt = rdi(vn->vn_cnt);
-                debug("file: %s, %d versions\n", &strTab[rdi(vn->vn_file)], aux_cnt);
-                off_t aux_off = rdi(vn->vn_aux);
-                if ((char *)vn + aux_off >= verneed_end)
-                    error(fmt("verneed entry aux out of bounds: idx=", i));
-                for(int j = 0; j < aux_cnt; j++){
-                    auto aux = (Elf_Vernaux *) ((char *)vn + aux_off);
-                    if ((char *)aux + sizeof(Elf_Vernaux) > verneed_end)
-                        error(fmt("verneed entry aux overflow: idx=", i, "aux idx=", j));
-                    auto ndx = rdi(aux->vna_other) & VERSYM_VERSION;
-                    debug("  %s, ndx=%d\n", &strTab[rdi(aux->vna_name)], ndx);
-                    if (ndx > max_ndx)
-                        max_ndx = ndx;
-                    if (rdi(aux->vna_next) == 0){
-                        if (j == aux_cnt - 1)
+        auto verneed_end = verneed + rdi(shdrVerNeed.sh_size);
+        off_t curoff = 0;
+        for(int i = 0; i < verneed_entries; i++){
+            Elf_Verneed *vn = (Elf_Verneed *) (verneed + curoff);
+            if ((char *)vn + sizeof(Elf_Verneed) > verneed_end)
+                error(fmt("verneed entry overflow: idx=", i));
+            auto aux_cnt = rdi(vn->vn_cnt);
+            debug("file: %s, %d versions\n", &strTab[rdi(vn->vn_file)], aux_cnt);
+            off_t aux_off = rdi(vn->vn_aux);
+            if ((char *)vn + aux_off >= verneed_end)
+                error(fmt("verneed entry aux out of bounds: idx=", i));
+            for(int j = 0; j < aux_cnt; j++){
+                auto aux = (Elf_Vernaux *) ((char *)vn + aux_off);
+                if ((char *)aux + sizeof(Elf_Vernaux) > verneed_end)
+                    error(fmt("verneed entry aux overflow: idx=", i, "aux idx=", j));
+                auto ndx = rdi(aux->vna_other) & VERSYM_VERSION;
+                debug("  %s, ndx=%d\n", &strTab[rdi(aux->vna_name)], ndx);
+                if(alsoPathVerNeed){
+                    for (auto it : mapFrom){
+                        if (it == &strTab[rdi(aux->vna_name)]){
+                            debug("    found %s, changing to %s\n", it.c_str(), mapTo.c_str());
+                            wri(aux->vna_name, mapToStrOff);
+                            wri(aux->vna_hash, sysvHash(mapTo));
                             break;
-                        else
-                            error(fmt("verneed entry should have next entry: idx=", i, "aux idx=", j));
+                        }
                     }
-                    if ((char *)aux + rdi(aux->vna_next) >= verneed_end)
-                        error(fmt("verneed entry next out of bounds: idx=", i, "aux idx=", j));
-                    aux_off += rdi(aux->vna_next);
                 }
-                if (rdi(vn->vn_next) == 0){
-                    if (i == verneed_entries - 1)
+                if (ndx > max_ndx)
+                    max_ndx = ndx;
+                if (rdi(aux->vna_next) == 0){
+                    if (j == aux_cnt - 1)
                         break;
                     else
-                        error(fmt("verneed entry should have next entry: idx=", i));
+                        error(fmt("verneed entry should have next entry: idx=", i, "aux idx=", j));
                 }
-                if ((char *)vn + rdi(vn->vn_next) >= verneed_end)
-                    error(fmt("verneed entry next out of bounds: idx=", i));
-                curoff += rdi(vn->vn_next);
+                if ((char *)aux + rdi(aux->vna_next) >= verneed_end)
+                    error(fmt("verneed entry next out of bounds: idx=", i, "aux idx=", j));
+                aux_off += rdi(aux->vna_next);
             }
-        }else{
-            debug("no .gnu.version_r found\n");
+            if (rdi(vn->vn_next) == 0){
+                if (i == verneed_entries - 1)
+                    break;
+                else
+                    error(fmt("verneed entry should have next entry: idx=", i));
+            }
+            if ((char *)vn + rdi(vn->vn_next) >= verneed_end)
+                error(fmt("verneed entry next out of bounds: idx=", i));
+            curoff += rdi(vn->vn_next);
         }
+    }else{
+        debug("no .gnu.version_r found\n");
+    }
+    if (map_to_ndx == -1){
         map_to_ndx = max_ndx + 1;
         debug("decided to use %d for %s\n", map_to_ndx, mapTo.c_str());
         if(map_to_ndx > VERSYM_VERSION){
@@ -2491,11 +2509,6 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
         wri(((Elf_Shdr *)(&shdrVerdef))->sh_info, rdi(shdrVerdef.sh_info) + 1);
         verdef_entries += 1;
 
-        auto & newDynStr = replaceSection(".dynstr", rdi(shdrDynStr.sh_size) + mapTo.size() + 1);
-        mapToStrOff = rdi(shdrDynStr.sh_size);
-        setSubstr(newDynStr, mapToStrOff, mapTo + '\0');
-        strTab = newDynStr.data();
-        strTabSize = newDynStr.size();
         wri(newVda->vda_name, mapToStrOff);
         mapToAdded = true;
     }else{
@@ -2660,6 +2673,7 @@ static bool printExecstack = false;
 static bool clearExecstack = false;
 static bool setExecstack = false;
 static bool remapSymvers = false;
+static bool remapVerneed = false;
 static std::string symverMapTo;
 static std::vector<std::string> symverMapFrom;
 
@@ -2720,7 +2734,7 @@ static void patchElf2(ElfFile && elfFile, const FileContents & fileContents, con
         elfFile.renameDynamicSymbols(symbolsToRename);
 
     if (remapSymvers)
-        elfFile.remapSymvers(symverMapTo, symverMapFrom);
+        elfFile.remapSymvers(symverMapTo, symverMapFrom, remapVerneed);
 
     if (elfFile.isChanged()){
         writeFile(fileName, elfFile.fileContents);
@@ -2788,6 +2802,7 @@ static void showHelp(const std::string & progName)
   [--rename-dynamic-symbols NAME_MAP_FILE]\tRenames dynamic symbols. The map file should contain two symbols (old_name new_name) per line\n\
   [--no-clobber-old-sections]\t\tDo not clobber old section values - only use when the binary expects to find section info at the old location.\n\
   [--remap-symvers TO=FROM1,FROM2...]\n\
+  [--also-remap-verneed]\n\
   [--output FILE]\n\
   [--debug]\n\
   [--version]\n\
@@ -2981,6 +2996,9 @@ static int mainWrapped(int argc, char * * argv)
                 symverMapFrom.push_back(mapping);
             if (symverMapFrom.empty())
                 error(fmt("Invalid symver mapping, must contains at least one from: ", mapping));
+        }
+        else if (arg == "--also-remap-verneed") {
+            remapVerneed = true;
         }
         else if (arg == "--help" || arg == "-h" ) {
             showHelp(argv[0]);
