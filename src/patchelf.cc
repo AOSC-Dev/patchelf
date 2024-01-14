@@ -2582,7 +2582,8 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
             auto sym = it->second;
             debug("Adding %s@%s to dynsym list\n", it->first.c_str(), mapTo.c_str());
             newDynsymSpan[i] = dynsyms[sym];
-            wri(newVersymSpan[i], map_to_ndx);
+            bool is_hidden = rdi(newVersymSpan[sym]) & VERSYM_HIDDEN;
+            wri(newVersymSpan[i], map_to_ndx | (is_hidden ? VERSYM_HIDDEN : 0));
             wri(newVersymSpan[sym], rdi(newVersymSpan[sym]) | VERSYM_HIDDEN);
             i += 1;
         }
