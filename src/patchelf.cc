@@ -2425,6 +2425,7 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
     }
     debug("parsing verneed entries\n", mapTo.c_str());
     auto verneedhdr = tryFindSectionHeader(".gnu.version_r");
+    std::map<int, int> verneedMap;
     if(verneedhdr){
         auto &shdrVerNeed = verneedhdr->get();
         auto verneed = (char *)(fileContents->data() + rdi(shdrVerNeed.sh_offset));
@@ -2460,8 +2461,12 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
                         }
                     }
                 }
-                if (ndx > max_ndx)
-                    max_ndx = ndx;
+                if(map_to_ndx == -1 && ndx >= max_ndx + 1){
+                    verneedMap[ndx] = ndx + 1;
+                    ndx = ndx + 1;
+                    wri(aux->vna_other, (rdi(aux->vna_other) & ~VERSYM_VERSION) | (ndx & VERSYM_VERSION));
+                    debug("    changing ndx to %d\n", ndx);
+                }
                 if (rdi(aux->vna_next) == 0){
                     if (j == aux_cnt - 1)
                         break;
@@ -2520,6 +2525,15 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
     for(size_t i = 0; i < count; i++){
         auto dynsym = &dynsyms[i];
         std::string name = strTab + rdi(dynsym->st_name);
+        auto verndx = rdi(versyms[i]);
+        auto verdef_ndx = verndx & VERSYM_VERSION;
+
+        if(verneedMap.find(verdef_ndx) != verneedMap.end()){
+            debug("verneed entry remapping for %s found at ndx=%d\n", name.c_str(), verdef_ndx);
+            verdef_ndx = verneedMap[verdef_ndx];
+            wri(versyms[i], (verndx & ~VERSYM_VERSION) | (verdef_ndx & VERSYM_VERSION));
+        }
+
         if(name.empty())
             continue;
         debug("dynsym entry %d: %s ", i, name.c_str());
@@ -2534,7 +2548,6 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
             debug("(common)\n");
             continue;
         }
-        auto verndx = rdi(versyms[i]);
         if(verndx == 0){
             debug("(local)\n");
             continue;
@@ -2542,7 +2555,6 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
             debug("(global)\n");
             continue;
         }
-        auto verdef_ndx = verndx & VERSYM_VERSION;
         if(verdefMap.find(verdef_ndx) == verdefMap.end()){
             debug("(verdef %d not found)\n", verdef_ndx);
             continue;
