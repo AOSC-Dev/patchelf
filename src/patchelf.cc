@@ -2347,7 +2347,7 @@ void ElfFile<ElfFileParamNames>::modifyExecstack(ExecstackMode op)
 }
 
 template<ElfFileParams>
-void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom, bool alsoPathVerNeed)
+void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const std::vector<std::string> & mapFrom, bool alsoPatchVerNeed)
 {
     auto shdrDynStr = findSectionHeader(".dynstr");
     auto shdrDynsym = findSectionHeader(".dynsym");
@@ -2450,7 +2450,7 @@ void ElfFile<ElfFileParamNames>::remapSymvers(const std::string & mapTo, const s
                     error(fmt("verneed entry aux overflow: idx=", i, "aux idx=", j));
                 auto ndx = rdi(aux->vna_other) & VERSYM_VERSION;
                 debug("  %s, ndx=%d\n", &strTab[rdi(aux->vna_name)], ndx);
-                if(alsoPathVerNeed){
+                if(alsoPatchVerNeed){
                     for (auto it : mapFrom){
                         if (it == &strTab[rdi(aux->vna_name)]){
                             debug("    found %s, changing to %s\n", it.c_str(), mapTo.c_str());
